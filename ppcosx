@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""ppcosx: launch PowerPC Mac OS X guests on the project's QEMU fork."""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+BUILD = os.path.join(ROOT, "build")
+
+# Each profile: emulator binary, QEMU CPU model, and the Mac OS X range that
+# real hardware of that class could run.
+PROFILES = {
+    "g3": {
+        "binary": "qemu-system-ppc",
+        "cpu": "750_v3.1",
+        "label": "PowerPC 750 (G3)",
+        "osx": "10.0 - 10.4",
+        "note": "No AltiVec, so 10.5 Leopard will refuse to install.",
+    },
+    "g4": {
+        "binary": "qemu-system-ppc",
+        "cpu": "7400_v2.9",
+        "label": "PowerPC 7400 (G4)",
+        "osx": "10.0 - 10.5",
+        "note": "Best-supported profile.",
+    },
+    "g4-7447a": {
+        "binary": "qemu-system-ppc",
+        "cpu": "7447a_v1.2",
+        "label": "PowerPC 7447A (late G4)",
+        "osx": "10.3 - 10.5",
+        "note": "Later G4 core; try this if software wants a faster G4.",
+    },
+    "g5": {
+        "binary": "qemu-system-ppc64",
+        # The original 970 (PowerMac7,2). Panther 10.3.0's kernel predates
+        # the 970FX and returns to the bootloader on one.
+        "cpu": "970_v2.2",
+        "label": "PowerPC 970 (G5)",
+        "osx": "10.2.7 - 10.5",
+        "note": "Tested with Panther 10.3.0, Tiger 10.4.6 and Leopard "
+                "10.5.4; presented to Mac OS X as a PowerMac3,1 with a 970.",
+    },
+}
+
+
+# What a Rage 128's ROM (FCode) does at boot and QEMU's card lacks: put the
+# card in 1024x768 at 8 bits per pixel (as Apple's ROMs do; 10.0's console
+# draws in nothing deeper) through its registers at 0x91000000, with an
+# 8-bit DAC, and describe that framebuffer in its node with the methods
+# BootX calls (open, close, set-colors, color!), so BootX has a screen to
+# draw on and to hand to the kernel. Mac OS X 10.0's kernel stops at its
+# first console message without one (later versions do without).
+RAGE128_BOOT_DISPLAY = (
+    ": aw! 91000000 + >r lbflip r> l! ; "
+    "100 58 aw! 7f0000 200 aw! 2ff0000 208 aw! 0 224 aw! 80 22c aw! "
+    "3000200 50 aw! 8000 54 aw! "
+    "90000000 ei \" address\" property 400 ei \" width\" property "
+    "300 ei \" height\" property 400 ei \" linebytes\" property "
+    "8 ei \" depth\" property : open true ; : close ; "
+    ": color! b0 aw! swap rot 10 lshift swap 8 lshift or or b4 aw! ; "
+    # (no >r inside the loop: `i` reads the return stack)
+    ": set-colors 0 ?do over i 3 * + over i + b0 aw! dup c@ 10 lshift "
+    "over 1+ c@ 8 lshift or swap 2+ c@ or b4 aw! loop 2drop ; "
+    # a console that discards text, and BootX's splash-screen methods
+    ": write nip ; : fbadr 400 * + 90000000 + ; "
+    ": fill-rectangle 0 ?do 2 pick 2 pick i + fbadr over 5 pick fill loop "
+    "2drop 2drop ; "
+    ": draw-rectangle 0 ?do 3 pick i 2 pick * + 3 pick 3 pick i + fbadr "
+    "2 pick move loop 2drop 2drop ; "
+    ": read-rectangle 0 ?do 2 pick 2 pick i + fbadr 4 pick i 3 pick * + "
+    "2 pick move loop 2drop 2drop ;")
+
+# Emulated graphics cards. Apple's own drivers (in every Mac OS X from 10.3
+# on, installers included) run them, so nothing is installed in the guest.
+# The card sits on the AGP bus and is described to Mac OS X by Open Firmware
+# Forth from tools/ati-agp-nvramrc.sh.
+CARDS = {
+    "radeon9600": {
+        # RV350, Quartz Extreme and Core Image. ATY,Pheonix is a name every
+        # version's ATI display driver (ndrv) accepts: Panther's has no
+        # ATY,Whelk, the name of Apple's own G5 Radeon 9600 boards.
+        "device": "ati-vga,model=rv350,romfile=,vgamem_mb=64",
+        "env": {"ATI_NAME": "ATY,Pheonix", "ATI_MODEL": "ATY,RV350AP",
+                "ATI_DEVID": "4150", "ATI_BAR0": "8000000",
+                "ATI_BAR2": "10000"},
+        "label": "Radeon 9600",
+    },
+    "radeon7000": {
+        # RV100: Quartz Extreme only (no Core Image)
+        "device": "ati-vga,model=rv100,romfile=,vgamem_mb=32",
+        "env": {},
+        "label": "Radeon 7000",
+    },
+    "rage128": {
+        # Rage 128 Pro (PCI 1002:5046), the AGP Power Mac G4's card: the
+        # only ATI card Mac OS X 10.0's display driver (ATIDriverUpdate)
+        # knows. 2D only: its 3D engine is not emulated.
+        "device": "ati-vga,model=rage128p,romfile=,vgamem_mb=16",
+        "env": {"ATI_NAME": "ATY,Rage128Pd", "ATI_MODEL": "ATY,Rage128Pd",
+                "ATI_DEVID": "5046", "ATI_BAR0": "1000000",
+                "ATI_BAR2": "4000", "ATI_FORTH": RAGE128_BOOT_DISPLAY,
+                # BootX opens the card, and so its bus
+                "ATI_BUS_FORTH": ": open true ; : close ;",
+                # the card is the console (BootX needs one)
+                # BootX's own rectangle words draw at frame-buffer-adr,
+                # which is 0 (the exception vectors) without a framebuffer
+                "ATI_AFTER_FORTH": "90000000 to frame-buffer-adr "
+                                   "\" /pci@f0000000/ATY,Rage128Pd\" output"},
+        "label": "Rage 128 Pro",
+    },
+}
+
+
+# nvramrc's start when there is sound: evaluate the ppcosx-sound variable
+SOUND_LOADER = ('" ppcosx-sound" " /options" find-package drop '
+                'get-package-property 0= if evaluate then')
+
+
+def card_forth(card, g5):
+    env = dict(os.environ, **CARDS[card]["env"])
+    if g5:
+        env["ATI_G5"] = "1"
+    return subprocess.run([os.path.join(ROOT, "tools", "ati-agp-nvramrc.sh")],
+                          capture_output=True, text=True, env=env,
+                          check=True).stdout.strip()
+
+
+def build_command(a):
+    p = PROFILES[a.cpu]
+    binary_name = p["binary"]
+    smp = []
+    forth = []
+    if a.display in CARDS:
+        forth.append(card_forth(a.display, p["cpu"].startswith("970")))
+    if a.smp > 1:
+        # One host thread per CPU (multi-threaded TCG), which QEMU offers
+        # only in its 64-bit binary; that one runs G3s and G4s as well.
+        # OpenBIOS lists only the boot CPU, so describe the others.
+        binary_name = "qemu-system-ppc64"
+        forth.append(subprocess.run(
+            [os.path.join(ROOT, "tools", "smp-nvramrc.sh"), str(a.smp)],
+            capture_output=True, text=True, check=True).stdout.strip())
+        smp = ["-smp", str(a.smp), "-accel", "tcg,thread=multi"]
+    audio = getattr(a, "audio", "none")
+    sound_env = []
+    if audio != "none":
+        # The sound chip's (Screamer's) Open Firmware node, in a variable of
+        # its own that nvramrc evaluates first (the Rage 128's Forth ends by
+        # making the card the console): Mac OS X 10.0 does not start with an
+        # nvramrc much over 2500 bytes.
+        forth.insert(0, SOUND_LOADER)
+        env = dict(os.environ)
+        if p["cpu"].startswith("970"):
+            env["SOUND_G5"] = "1"
+        sound_env = ["-prom-env", "ppcosx-sound=" + subprocess.run(
+            [os.path.join(ROOT, "tools", "sound-nvramrc.sh")], env=env,
+            capture_output=True, text=True, check=True).stdout.strip()]
+    if forth:
+        smp += ["-prom-env", "use-nvramrc?=true",
+                "-prom-env", "nvramrc=" + " ".join(forth)] + sound_env
+    binary = os.path.join(BUILD, binary_name)
+    if not os.path.exists(binary):
+        sys.exit(f"{binary} not found; build the fork first (see README.md)")
+
+    # 10.0/10.1 predate usable USB input drivers, so give them ADB via CUDA.
+    via = "cuda" if a.legacy_input else "pmu"
+    cmd = [
+        binary,
+        "-M", f"mac99,via={via}" + (",audiodev=snd0" if audio != "none" else ""),
+        "-cpu", p["cpu"],
+        "-m", str(a.ram),
+        *smp,
+        "-g", a.resolution,
+        "-prom-env", "auto-boot?=true",
+        "-prom-env", "vga-ndrv?=true",
+        "-boot", a.boot,
+    ]
+    forwards = list(getattr(a, "forwards", []))
+    if a.ssh_port:
+        forwards.append(("tcp", a.ssh_port, 22))
+    if getattr(a, "network", "nat") == "nat":
+        cmd += ["-netdev", "user,id=net0" + "".join(
+                    f",hostfwd={proto}:127.0.0.1:{host}-:{guest}"
+                    for proto, host, guest in forwards),
+                "-device", f"{getattr(a, 'nic', 'sungem')},netdev=net0"]
+    else:
+        cmd += ["-nic", "none"]
+    drives = getattr(a, "drives", None)
+    if drives is None:
+        drives = []
+        if a.hd:
+            drives.append({"type": "disk", "file": a.hd})
+        if a.cdrom:
+            drives.append({"type": "cdrom", "file": a.cdrom})
+    disk_index, cd_index = 0, 2
+    for n, d in enumerate(drives):
+        name = d.get("id") or f"drive{n}"
+        ro = ",readonly=on" if d.get("readOnly") else ""
+        if d["type"] == "cdrom":
+            # The optical drive on the second ATA bus, as on real Power
+            # Macs (and in place of QEMU's empty default one); Jaguar's CD
+            # driver panics in IOService::activityTickle when the disc is
+            # the hard disk's slave. It may be empty, to insert media later.
+            media = f",file={d['file']},format=raw" if d.get("file") else ""
+            cmd += ["-drive", f"id={name},if=ide,index={cd_index},"
+                              f"media=cdrom{media}"]
+            cd_index += 1
+        elif d["type"] == "usb":
+            fmt = "qcow2" if d["file"].endswith(".qcow2") else "raw"
+            cmd += ["-drive", f"id={name},if=none,file={d['file']},"
+                              f"format={fmt}{ro}",
+                    "-device", f"usb-storage,drive={name}"]
+        else:
+            fmt = "qcow2" if d["file"].endswith(".qcow2") else "raw"
+            cmd += ["-drive", f"id={name},if=ide,index={disk_index},"
+                              f"file={d['file']},format={fmt},"
+                              f"media=disk{ro}"]
+            disk_index += 1
+    if not a.legacy_input:
+        # An absolute pointer, so the guest's pointer is where the host's
+        # is. Leopard trims 7.5% off each end of a tablet's range; the
+        # margin undoes that.
+        tablet = "usb-tablet"
+        if a.guest == "10.5":
+            tablet += ",abs-margin=2458"
+        if a.guest in ("10.0", "10.1", "10.2"):
+            # These have no absolute pointer support: with a tablet present
+            # the guest moves the pointer only from the relative mouse and
+            # its button presses went to the tablet. The machine's own
+            # USB mouse is used instead (Cocoa grabs the host pointer).
+            tablet = None
+        # The machine's own USB keyboard presents an Apple Pro Keyboard's
+        # IDs, so Leopard skips its Keyboard Setup Assistant.
+        if tablet:
+            cmd += ["-device", tablet]
+    if a.display in CARDS:
+        # The card is the only display. It has no firmware ROM, so the
+        # screen stays dark until Mac OS X's driver takes it over.
+        cmd += ["-vga", "none", "-device", CARDS[a.display]["device"] +
+                ",agp=on,bus=agp,addr=0x10,id=ati0"]
+    elif a.gpu_primary:
+        # No firmware or boot-progress picture: the screen stays blank until
+        # the guest's PPCOSXFramebuffer driver loads.
+        cmd += ["-vga", "none"]
+    if a.gpu or a.gpu_primary:
+        cmd += ["-device", f"ppcosx-gpu,vram={a.vram}M"]
+    for vendor, product in getattr(a, "usb", []):
+        # a USB device of this Mac, handed to the guest
+        cmd += ["-device", f"usb-host,id=usb-{vendor:04x}-{product:04x},"
+                           f"vendorid=0x{vendor:04x},productid=0x{product:04x}"]
+    sh = getattr(a, "sharing", None)
+    if sh:
+        # the screen over VNC; the password is set over QMP once running
+        opts = ",password=on" + (",lossy=on" if sh["jpeg"] else "")
+        if sh["tls"]:
+            cmd += ["-object", "tls-creds-x509,id=vnctls,dir=" + sh["tlsdir"] +
+                    ",endpoint=server,verify-peer=off"]
+            opts += ",tls-creds=vnctls"
+        addr = "0.0.0.0" if sh["remote"] else "127.0.0.1"
+        cmd += ["-vnc", f"{addr}:{sh['port'] - 5900}{opts}"]
+    if audio != "none":
+        # "coreaudio" (this Mac's output), or e.g. "wav,path=out.wav"
+        cmd += ["-audiodev", f"{audio},id=snd0"]
+    if a.qmp_port:
+        cmd += ["-qmp", f"tcp:127.0.0.1:{a.qmp_port},server,nowait"]
+    if getattr(a, "qmp_socket", None):
+        cmd += ["-qmp", f"unix:{a.qmp_socket},server,nowait"]
+    if getattr(a, "pidfile", None):
+        cmd += ["-pidfile", a.pidfile]
+    if getattr(a, "name", None):
+        # the window's title, and what the window's toolbar calls the VM
+        cmd += ["-name", a.name]
+    if getattr(a, "display_socket", None):
+        # the ppcOSX app's window draws the screen (qemu/ui/ppcosx.c)
+        cmd += ["-display", f"ppcosx,socket={a.display_socket}"]
+    elif a.headless:
+        cmd += ["-display", "none", "-serial", "stdio"]
+    else:
+        # Apple's ATI drivers draw the pointer as a hardware cursor
+        cmd += ["-display", "cocoa,show-cursor=off" if a.display in CARDS
+                else "cocoa"]
+    return cmd + a.extra
+
+
+GUESTS = ["10.0", "10.1", "10.2", "10.3", "10.4", "10.5"]
+
+
+def load_vm(a):
+    """Fill run options from a VM folder's config.json (written by the
+    ppcOSX app): every setting has a default, so older files still load."""
+    vm = os.path.abspath(a.vm)
+    with open(os.path.join(vm, "config.json")) as f:
+        c = json.load(f)
+
+    def path(p):
+        # ssh:// and https:// images are opened by QEMU itself
+        return p if os.path.isabs(p) or "://" in p else os.path.join(vm, p)
+
+    guest = c.get("guest", "10.4")
+    a.guest = guest if guest in GUESTS else None
+    a.cpu = c.get("cpu", "g4")
+    if a.cpu not in PROFILES:
+        sys.exit(f"{a.vm}: unknown CPU {a.cpu}")
+    a.smp = max(1, min(4, int(c.get("cores", 1))))
+    a.ram = int(c.get("memory", 1024))
+    a.display = c.get("graphics", "radeon9600")
+    if a.display not in [*CARDS, "vga"]:
+        sys.exit(f"{a.vm}: unknown graphics {a.display}")
+    a.resolution = c.get("resolution", "1024x768x32")
+    inp = c.get("input", "auto")
+    a.legacy_input = inp == "adb" or (
+        inp == "auto" and (guest in ("10.0", "10.1") or guest.startswith("9")))
+    a.boot = "d" if c.get("boot") == "cdrom" else "c"
+    a.drives = []
+    for n, d in enumerate(c.get("drives", [])):
+        d = dict(d)
+        d.setdefault("id", f"{d.get('type', 'disk')}{n}")
+        if d.get("file"):
+            d["file"] = path(d["file"])
+            if "://" not in d["file"] and not os.path.exists(d["file"]):
+                if d.get("type") == "cdrom":
+                    print(f"{d['file']}: not found, drive left empty",
+                          file=sys.stderr)
+                    d["file"] = ""
+                else:
+                    sys.exit(f"{d['file']}: no such file")
+        elif d.get("type") != "cdrom":
+            continue
+        a.drives.append(d)
+    if not any(d["type"] == "cdrom" for d in a.drives):
+        a.drives.append({"type": "cdrom", "id": "cdrom0", "file": ""})
+    net = c.get("network", {})
+    a.network = net.get("mode", "nat")
+    a.nic = net.get("adapter", "sungem")
+    a.forwards = [(f.get("protocol", "tcp"), int(f["host"]), int(f["guest"]))
+                  for f in net.get("forwards", [])]
+    a.usb = [(int(u["vendor"]), int(u["product"])) for u in c.get("usb", [])]
+    # sound: on unless turned off (version 1 files said off only because
+    # there was no sound chip yet)
+    on = c.get("audio", {}).get("enabled", True) or int(c.get("version", 1)) < 2
+    if not on:
+        a.audio = "none"
+    elif getattr(a, "audio", "none") == "none":
+        a.audio = "coreaudio"
+    sh = c.get("sharing", {})
+    a.sharing = None
+    if sh.get("enabled"):
+        a.sharing = {"port": int(sh.get("port", 5900)),
+                     "remote": bool(sh.get("remote", False)),
+                     "tls": bool(sh.get("tls", False)),
+                     "jpeg": bool(sh.get("jpeg", True)),
+                     "tlsdir": os.path.join(vm, "tls")}
+    a.gpu = a.gpu_primary = False
+    a.name = c.get("name", os.path.basename(vm))
+    # a Unix socket path is limited to about 100 bytes: callers may give
+    # a shorter one than the VM folder's
+    a.qmp_socket = a.qmp_socket or os.path.join(vm, "qmp.sock")
+    if os.path.exists(a.qmp_socket):
+        os.unlink(a.qmp_socket)
+    # so a VM manager restarted while the VM runs can find it again
+    a.pidfile = os.path.join(vm, "qemu.pid")
+    a.hd = a.cdrom = None
+
+
+def cmd_run(a):
+    if a.vm:
+        load_vm(a)
+        cmd = build_command(a)
+        print(" ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+        if a.dry_run_json:
+            json.dump(cmd, sys.stdout)
+            print()
+            return 0
+        if a.dry_run:
+            return 0
+        sys.stderr.flush()
+        # QEMU in this process's place, so whoever started us can wait for,
+        # signal and see the emulator itself
+        os.execv(cmd[0], cmd)
+    for path in (a.hd, a.cdrom):
+        if path and not os.path.exists(path):
+            sys.exit(f"{path}: no such file")
+    cmd = build_command(a)
+    print(" ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+    if a.dry_run:
+        return 0
+    return subprocess.call(cmd)
+
+
+def cmd_machine_data(_):
+    """The tables the ppcOSX app builds command lines from, as JSON: it
+    mirrors build_command, and tools/check-app-command.sh compares the two."""
+    json.dump({"profiles": PROFILES,
+               "cards": {k: {"device": v["device"], "env": v["env"],
+                             "label": v["label"]} for k, v in CARDS.items()}},
+              sys.stdout, indent=1)
+    print()
+    return 0
+
+
+def cmd_create_disk(a):
+    qemu_img = shutil.which("qemu-img")
+    if not qemu_img:
+        sys.exit("qemu-img not found on PATH (brew install qemu)")
+    if os.path.exists(a.path):
+        sys.exit(f"{a.path} already exists")
+    return subprocess.call([qemu_img, "create", "-f", "qcow2", a.path, a.size])
+
+
+def cmd_cpus(_):
+    for name, p in PROFILES.items():
+        print(f"{name:9} {p['label']:26} Mac OS X {p['osx']}")
+        print(f"{'':9} {p['note']}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ppcosx", description=__doc__)
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="boot a guest")
+    run.add_argument("--cpu", choices=PROFILES, default="g4")
+    run.add_argument("--smp", type=int, choices=range(1, 5), default=1,
+                     metavar="N", help="CPUs, 1-4 (a dual G4, a quad G5...)")
+    run.add_argument("--ram", type=int, default=1024, help="MiB (default 1024)")
+    run.add_argument("--hd", help="qcow2 hard disk image")
+    run.add_argument("--cdrom", help="install CD/DVD image (.iso/.cdr)")
+    run.add_argument("--boot", choices=["c", "d"], default="c",
+                     help="c = hard disk, d = CD-ROM")
+    run.add_argument("--resolution", default="1024x768x32")
+    run.add_argument("--legacy-input", action="store_true",
+                     help="ADB keyboard/mouse, needed by Mac OS X 10.0/10.1")
+    run.add_argument("--display", choices=[*CARDS, "vga"],
+                     default="radeon9600",
+                     help="graphics card: radeon9600 (default; Quartz "
+                          "Extreme and Core Image), radeon7000 (Quartz "
+                          "Extreme; Mac OS X 10.1 on), rage128 (Rage 128 "
+                          "Pro, 2D and OpenGL, for Mac OS X 10.0), vga (QEMU's "
+                          "standard VGA)")
+    run.add_argument("--guest", choices=["10.0", "10.1", "10.2", "10.3",
+                                          "10.4", "10.5"],
+                     help="the Mac OS X version installed (or being "
+                          "installed), for version-specific adjustments; "
+                          "10.5 corrects its pointer position")
+    run.add_argument("--gpu", action="store_true",
+                     help="attach ppcosx-gpu as a second display")
+    run.add_argument("--gpu-primary", action="store_true",
+                     help="make ppcosx-gpu the only display (the guest must "
+                          "already have PPCOSXFramebuffer.kext installed)")
+    run.add_argument("--vram", type=int, default=64, help="ppcosx-gpu MiB")
+    run.add_argument("--ssh-port", type=int, metavar="PORT",
+                     help="forward this host port (on 127.0.0.1) to the "
+                          "guest's SSH port")
+    run.add_argument("--qmp-port", type=int, metavar="PORT",
+                     help="QEMU machine protocol on this host port "
+                          "(127.0.0.1), for scripting the VM")
+    run.add_argument("--headless", action="store_true",
+                     help="no window; firmware console on stdio")
+    run.add_argument("--vm", metavar="DIR",
+                     help="run the VM in this folder (its config.json, as "
+                          "the ppcOSX app writes it); other options are "
+                          "ignored")
+    run.add_argument("--qmp-socket", metavar="PATH",
+                     help="with --vm: QMP on this Unix socket (default: "
+                          "qmp.sock in the VM folder)")
+    run.add_argument("--audio", default="coreaudio", metavar="BACKEND",
+                     help="sound: a QEMU audio backend and its options "
+                          "(default coreaudio; e.g. wav,path=out.wav; none "
+                          "for no sound chip)")
+    run.add_argument("--display-socket", metavar="PATH",
+                     help="serve the screen on this Unix socket to the "
+                          "ppcOSX app instead of opening a window")
+    run.add_argument("--dry-run-json", action="store_true",
+                     help=argparse.SUPPRESS)
+    run.add_argument("--dry-run", action="store_true",
+                     help="print the QEMU command and exit")
+    run.add_argument("extra", nargs=argparse.REMAINDER,
+                     help="arguments after -- are passed to QEMU")
+    run.set_defaults(func=cmd_run)
+
+    disk = sub.add_parser("create-disk", help="create a blank qcow2 disk")
+    disk.add_argument("path")
+    disk.add_argument("size", nargs="?", default="40G")
+    disk.set_defaults(func=cmd_create_disk)
+
+    md = sub.add_parser("machine-data", help="CPU profiles and graphics "
+                        "cards as JSON (for the ppcOSX app)")
+    md.set_defaults(func=cmd_machine_data)
+
+    cpus = sub.add_parser("cpus", help="list CPU profiles")
+    cpus.set_defaults(func=cmd_cpus)
+
+    a = ap.parse_args()
+    if getattr(a, "extra", None) and a.extra[0] == "--":
+        a.extra = a.extra[1:]
+    sys.exit(a.func(a))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,29 @@
+# Builds (tools/build-dist-*.sh, QEMU's build directory, Xcode)
+build/
+dist/
+app/build/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Mac OS installer images and virtual machine disks
+install images/
+vms/
+*.qcow2
+*.iso
+*.cdr
+*.dmg
+*.img
+*.toast
+# QEMU's own firmware and test images are source
+!/qemu/**/*.img
+!/qemu/**/*.iso
+!/qemu/**/*.qcow2
+
+# macOS
+.DS_Store
+
+# assistant tooling
+CLAUDE.md
+CLAUDE.local.md
+.claude/
