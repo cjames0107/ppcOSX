@@ -3,6 +3,16 @@
 A PowerPC Mac emulator for running Mac OS X 10.0 - 10.5, built on a fork of
 QEMU 10.1.3 with a paravirtual GPU device for host-accelerated graphics.
 
+## Screenshots
+<img width="1392" height="964" alt="Screenshot 2026-11-23 at 10 07 16 PM" src="https://github.com/user-attachments/assets/117c999c-af5f-4455-83b3-a37bb5ed4de8" />
+10.5.6 Leopard, configured with Quad G5s and functioning QE / CI
+
+<img width="1392" height="964" alt="Screenshot 2026-11-23 at 10 09 00 PM" src="https://github.com/user-attachments/assets/b4ba4d43-f887-40ce-b470-01717266986d" />
+10.4.11 Tiger, configured with Dual G4s and functioning QE / CI
+
+<img width="1136" height="932" alt="Screenshot 2026-11-23 at 10 09 54 PM" src="https://github.com/user-attachments/assets/7af1cac6-dfce-4c8d-a49e-f1e481a5b426" />
+10.2 Jaguar, configured with a G3, and the Apple System Profiler open
+
 ## Layout
 
 - `qemu/` - the QEMU fork (its own git checkout, branch `ppcosx`, based on
